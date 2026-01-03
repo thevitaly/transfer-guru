@@ -22,6 +22,7 @@ function formatNumber(num) {
 function App() {
   const [status, setStatus] = useState(null)
   const [loading, setLoading] = useState(false)
+  const [uploadProgress, setUploadProgress] = useState('')
   const [error, setError] = useState(null)
   const [summary, setSummary] = useState(null)
   const [currencies, setCurrencies] = useState([])
@@ -59,23 +60,32 @@ function App() {
   async function uploadFile(file) {
     setLoading(true)
     setError(null)
+    setUploadProgress('Uploading file...')
     try {
       const formData = new FormData()
       formData.append('file', file)
+      setUploadProgress(`Uploading ${(file.size / 1024 / 1024).toFixed(1)}MB...`)
+
       const res = await fetch(`${API_URL}/api/upload`, {
         method: 'POST',
         body: formData
       })
+
+      setUploadProgress('Processing data...')
       const data = await res.json()
+
       if (data.success) {
         setStatus({ loaded: true, filename: data.filename, row_count: data.total_rows })
+        setUploadProgress('')
         loadCurrencies()
         loadSummary()
       } else {
         setError(data.detail || 'Failed to upload file')
+        setUploadProgress('')
       }
     } catch (e) {
-      setError('Failed to upload file')
+      setError('Failed to upload file. The file may be too large or the server timed out.')
+      setUploadProgress('')
     }
     setLoading(false)
   }
@@ -286,9 +296,10 @@ function App() {
           <div className="status-info">
             <span className="status-badge">No data</span>
             <label className="file-upload-btn primary">
-              {loading ? 'Loading...' : 'Upload XLSX file'}
+              {loading ? (uploadProgress || 'Loading...') : 'Upload XLSX file'}
               <input type="file" accept=".xlsx" onChange={handleFileSelect} disabled={loading} />
             </label>
+            {loading && <div className="loading-spinner"></div>}
           </div>
         )}
       </section>

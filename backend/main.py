@@ -1,12 +1,10 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 import pandas as pd
-from openpyxl import load_workbook
 import os
 from typing import Optional
 import tempfile
-import shutil
+import io
 
 app = FastAPI(title="Transfer Guru API")
 
@@ -24,87 +22,52 @@ DATA_STORE = {
     "filename": None
 }
 
-# Column mappings
-COLUMNS = {
-    "legal_name": 0,
-    "brand_name": 1,
-    "acquirer": 2,
-    "currency": 5,
-    "amount": 6,
-    "fee": 8,
-    "psp_buy_fee": 11,
-    "type": 14,
-    "status": 15,
-}
+# Column names we need
+COLUMNS_NEEDED = [
+    "Legal Name", "Brand Name", "Acquirer", "Currency",
+    "Amount", "Fee", "PSP Buy Fee", "Type", "Status"
+]
 
-HEADER_ROW = 16  # 0-indexed: row 16 is headers, data starts at 17
+HEADER_ROW = 15  # 0-indexed row where headers are
 
 
-def parse_european_number(value):
-    """Convert European format numbers (comma as decimal) to float"""
-    if value is None:
-        return 0.0
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        # Skip formula cells
-        if value.startswith("="):
-            return 0.0
-        # Replace comma with dot for European format
-        value = value.replace(",", ".")
-        try:
-            return float(value)
-        except ValueError:
-            return 0.0
-    return 0.0
+def load_xlsx_data_fast(file_path_or_buffer) -> pd.DataFrame:
+    """Load xlsx file using pandas - much faster than openpyxl"""
+    # Read only needed columns, skip first rows
+    df = pd.read_excel(
+        file_path_or_buffer,
+        header=HEADER_ROW,
+        usecols=lambda x: x in COLUMNS_NEEDED,
+        engine='openpyxl'
+    )
 
+    # Rename columns to snake_case
+    df.columns = df.columns.str.lower().str.replace(' ', '_')
 
-def load_xlsx_data(file_path: str) -> pd.DataFrame:
-    """Load xlsx file and return cleaned DataFrame"""
-    wb = load_workbook(file_path, read_only=True, data_only=True)
-    ws = wb.active
+    # Filter out rows with invalid type/status (formulas, nulls, numbers)
+    df = df.dropna(subset=['type', 'status'])
+    df = df[df['type'].apply(lambda x: isinstance(x, str) and not str(x).startswith('='))]
+    df = df[df['status'].apply(lambda x: isinstance(x, str) and not str(x).startswith('='))]
 
-    data = []
-    for row_idx, row in enumerate(ws.iter_rows(min_row=HEADER_ROW + 2, values_only=True)):
-        # Skip rows with formulas in Type column (summary rows at bottom)
-        type_val = row[COLUMNS["type"]]
-        status_val = row[COLUMNS["status"]]
+    # Normalize type and status
+    df['type'] = df['type'].str.lower().str.strip()
+    df['status'] = df['status'].str.lower().str.strip()
 
-        if type_val is None or status_val is None:
-            continue
-        if isinstance(type_val, str) and type_val.startswith("="):
-            continue
-        if not isinstance(type_val, str):
-            continue
+    # Convert numeric columns
+    for col in ['amount', 'fee', 'psp_buy_fee']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
-        # Normalize type and status
-        type_lower = type_val.lower().strip()
-        status_lower = status_val.lower().strip() if isinstance(status_val, str) else str(status_val).lower().strip()
+    # Fill missing string columns
+    for col in ['legal_name', 'brand_name', 'acquirer', 'currency']:
+        if col in df.columns:
+            df[col] = df[col].fillna('').astype(str)
 
-        data.append({
-            "legal_name": str(row[COLUMNS["legal_name"]] or ""),
-            "brand_name": str(row[COLUMNS["brand_name"]] or ""),
-            "acquirer": str(row[COLUMNS["acquirer"]] or ""),
-            "currency": str(row[COLUMNS["currency"]] or ""),
-            "amount": parse_european_number(row[COLUMNS["amount"]]),
-            "fee": parse_european_number(row[COLUMNS["fee"]]),
-            "psp_buy_fee": parse_european_number(row[COLUMNS["psp_buy_fee"]]),
-            "type": type_lower,
-            "status": status_lower,
-        })
-
-    wb.close()
-    return pd.DataFrame(data)
+    return df
 
 
 def filter_by_operation_type(df: pd.DataFrame, op_type: int) -> pd.DataFrame:
-    """
-    Filter data by operation type:
-    1 = purchase (paid, refunded, chargedback)
-    2 = refund (success)
-    3 = chargeback (success)
-    4 = payout (success)
-    """
+    """Filter data by operation type"""
     if op_type == 1:
         return df[
             (df["type"] == "purchase") &
@@ -121,10 +84,7 @@ def filter_by_operation_type(df: pd.DataFrame, op_type: int) -> pd.DataFrame:
 
 
 def build_pivot_by_acquirer(df: pd.DataFrame) -> dict:
-    """
-    Build pivot table grouped by: Acquirer → Legal Name → Currency
-    Type 1 format
-    """
+    """Build pivot table grouped by: Acquirer → Legal Name → Currency"""
     if df.empty:
         return {"groups": [], "totals": {"amount": 0, "fee": 0, "psp_buy_fee": 0, "count": 0}}
 
@@ -136,36 +96,34 @@ def build_pivot_by_acquirer(df: pd.DataFrame) -> dict:
     ).reset_index()
 
     result = {"groups": [], "totals": {
-        "amount": round(grouped["amount"].sum(), 2),
-        "fee": round(grouped["fee"].sum(), 2),
-        "psp_buy_fee": round(grouped["psp_buy_fee"].sum(), 2),
+        "amount": round(float(grouped["amount"].sum()), 2),
+        "fee": round(float(grouped["fee"].sum()), 2),
+        "psp_buy_fee": round(float(grouped["psp_buy_fee"].sum()), 2),
         "count": int(grouped["count"].sum())
     }}
 
-    # Group by acquirer
     for acquirer in grouped["acquirer"].unique():
         acq_data = grouped[grouped["acquirer"] == acquirer]
         acq_group = {
             "acquirer": acquirer,
             "merchants": [],
             "subtotals": {
-                "amount": round(acq_data["amount"].sum(), 2),
-                "fee": round(acq_data["fee"].sum(), 2),
-                "psp_buy_fee": round(acq_data["psp_buy_fee"].sum(), 2),
+                "amount": round(float(acq_data["amount"].sum()), 2),
+                "fee": round(float(acq_data["fee"].sum()), 2),
+                "psp_buy_fee": round(float(acq_data["psp_buy_fee"].sum()), 2),
                 "count": int(acq_data["count"].sum())
             }
         }
 
-        # Group by legal_name within acquirer
         for legal_name in acq_data["legal_name"].unique():
             merchant_data = acq_data[acq_data["legal_name"] == legal_name]
             merchant_group = {
                 "legal_name": legal_name,
                 "currencies": [],
                 "subtotals": {
-                    "amount": round(merchant_data["amount"].sum(), 2),
-                    "fee": round(merchant_data["fee"].sum(), 2),
-                    "psp_buy_fee": round(merchant_data["psp_buy_fee"].sum(), 2),
+                    "amount": round(float(merchant_data["amount"].sum()), 2),
+                    "fee": round(float(merchant_data["fee"].sum()), 2),
+                    "psp_buy_fee": round(float(merchant_data["psp_buy_fee"].sum()), 2),
                     "count": int(merchant_data["count"].sum())
                 }
             }
@@ -173,9 +131,9 @@ def build_pivot_by_acquirer(df: pd.DataFrame) -> dict:
             for _, row in merchant_data.iterrows():
                 merchant_group["currencies"].append({
                     "currency": row["currency"],
-                    "amount": round(row["amount"], 2),
-                    "fee": round(row["fee"], 2),
-                    "psp_buy_fee": round(row["psp_buy_fee"], 2),
+                    "amount": round(float(row["amount"]), 2),
+                    "fee": round(float(row["fee"]), 2),
+                    "psp_buy_fee": round(float(row["psp_buy_fee"]), 2),
                     "count": int(row["count"])
                 })
 
@@ -187,10 +145,7 @@ def build_pivot_by_acquirer(df: pd.DataFrame) -> dict:
 
 
 def build_pivot_by_merchant(df: pd.DataFrame) -> dict:
-    """
-    Build pivot table grouped by: Legal Name → Acquirer → Currency
-    Type 2 format
-    """
+    """Build pivot table grouped by: Legal Name → Acquirer → Currency"""
     if df.empty:
         return {"groups": [], "totals": {"amount": 0, "fee": 0, "psp_buy_fee": 0, "count": 0}}
 
@@ -202,36 +157,34 @@ def build_pivot_by_merchant(df: pd.DataFrame) -> dict:
     ).reset_index()
 
     result = {"groups": [], "totals": {
-        "amount": round(grouped["amount"].sum(), 2),
-        "fee": round(grouped["fee"].sum(), 2),
-        "psp_buy_fee": round(grouped["psp_buy_fee"].sum(), 2),
+        "amount": round(float(grouped["amount"].sum()), 2),
+        "fee": round(float(grouped["fee"].sum()), 2),
+        "psp_buy_fee": round(float(grouped["psp_buy_fee"].sum()), 2),
         "count": int(grouped["count"].sum())
     }}
 
-    # Group by legal_name
     for legal_name in grouped["legal_name"].unique():
         merchant_data = grouped[grouped["legal_name"] == legal_name]
         merchant_group = {
             "legal_name": legal_name,
             "acquirers": [],
             "subtotals": {
-                "amount": round(merchant_data["amount"].sum(), 2),
-                "fee": round(merchant_data["fee"].sum(), 2),
-                "psp_buy_fee": round(merchant_data["psp_buy_fee"].sum(), 2),
+                "amount": round(float(merchant_data["amount"].sum()), 2),
+                "fee": round(float(merchant_data["fee"].sum()), 2),
+                "psp_buy_fee": round(float(merchant_data["psp_buy_fee"].sum()), 2),
                 "count": int(merchant_data["count"].sum())
             }
         }
 
-        # Group by acquirer within merchant
         for acquirer in merchant_data["acquirer"].unique():
             acq_data = merchant_data[merchant_data["acquirer"] == acquirer]
             acq_group = {
                 "acquirer": acquirer,
                 "currencies": [],
                 "subtotals": {
-                    "amount": round(acq_data["amount"].sum(), 2),
-                    "fee": round(acq_data["fee"].sum(), 2),
-                    "psp_buy_fee": round(acq_data["psp_buy_fee"].sum(), 2),
+                    "amount": round(float(acq_data["amount"].sum()), 2),
+                    "fee": round(float(acq_data["fee"].sum()), 2),
+                    "psp_buy_fee": round(float(acq_data["psp_buy_fee"].sum()), 2),
                     "count": int(acq_data["count"].sum())
                 }
             }
@@ -239,9 +192,9 @@ def build_pivot_by_merchant(df: pd.DataFrame) -> dict:
             for _, row in acq_data.iterrows():
                 acq_group["currencies"].append({
                     "currency": row["currency"],
-                    "amount": round(row["amount"], 2),
-                    "fee": round(row["fee"], 2),
-                    "psp_buy_fee": round(row["psp_buy_fee"], 2),
+                    "amount": round(float(row["amount"]), 2),
+                    "fee": round(float(row["fee"]), 2),
+                    "psp_buy_fee": round(float(row["psp_buy_fee"]), 2),
                     "count": int(row["count"])
                 })
 
@@ -272,13 +225,13 @@ async def upload_file(file: UploadFile = File(...)):
     if not file.filename.endswith(".xlsx"):
         raise HTTPException(status_code=400, detail="Only .xlsx files are supported")
 
-    # Save to temp file
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
-        shutil.copyfileobj(file.file, tmp)
-        tmp_path = tmp.name
-
     try:
-        df = load_xlsx_data(tmp_path)
+        # Read file content into memory
+        content = await file.read()
+        file_buffer = io.BytesIO(content)
+
+        # Parse with pandas (faster)
+        df = load_xlsx_data_fast(file_buffer)
         DATA_STORE["df"] = df
         DATA_STORE["filename"] = file.filename
 
@@ -292,8 +245,8 @@ async def upload_file(file: UploadFile = File(...)):
             "total_rows": len(df),
             "type_status_breakdown": stats
         }
-    finally:
-        os.unlink(tmp_path)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
 
 
 @app.post("/api/load-default")
@@ -304,11 +257,10 @@ async def load_default_file():
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail="Default file not found")
 
-    df = load_xlsx_data(file_path)
+    df = load_xlsx_data_fast(file_path)
     DATA_STORE["df"] = df
     DATA_STORE["filename"] = "tab.xlsx"
 
-    # Get stats
     type_counts = df.groupby(["type", "status"]).size().reset_index(name="count")
     stats = type_counts.to_dict(orient="records")
 
@@ -323,29 +275,19 @@ async def load_default_file():
 @app.get("/api/pivot")
 async def get_pivot(
     operation_type: int,
-    view_type: int = 1,  # 1 = by acquirer, 2 = by merchant
+    view_type: int = 1,
     currency: Optional[str] = None
 ):
-    """
-    Get pivot table data
-
-    operation_type: 1-4 (purchase, refund, chargeback, payout)
-    view_type: 1 = Acquirer→Legal Name→Currency, 2 = Legal Name→Acquirer→Currency
-    currency: Optional filter by currency (e.g., "EUR")
-    """
+    """Get pivot table data"""
     if DATA_STORE["df"] is None:
         raise HTTPException(status_code=400, detail="No data loaded. Upload a file first.")
 
     df = DATA_STORE["df"].copy()
-
-    # Filter by operation type
     df = filter_by_operation_type(df, operation_type)
 
-    # Filter by currency if specified
     if currency:
         df = df[df["currency"] == currency.upper()]
 
-    # Build pivot based on view type
     if view_type == 1:
         pivot = build_pivot_by_acquirer(df)
     else:
@@ -376,7 +318,6 @@ async def get_summary():
         raise HTTPException(status_code=400, detail="No data loaded")
 
     df = DATA_STORE["df"]
-
     summaries = []
     operation_names = {
         1: "Purchase (paid/refunded/chargedback)",
@@ -391,9 +332,9 @@ async def get_summary():
             "operation_type": op_type,
             "name": operation_names[op_type],
             "count": len(filtered),
-            "total_amount": round(filtered["amount"].sum(), 2),
-            "total_fee": round(filtered["fee"].sum(), 2),
-            "total_psp_buy_fee": round(filtered["psp_buy_fee"].sum(), 2)
+            "total_amount": round(float(filtered["amount"].sum()), 2),
+            "total_fee": round(float(filtered["fee"].sum()), 2),
+            "total_psp_buy_fee": round(float(filtered["psp_buy_fee"].sum()), 2)
         })
 
     return {"summaries": summaries}
