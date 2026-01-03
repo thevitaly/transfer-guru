@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import './App.css'
 
-const API_URL = 'http://localhost:8080'
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8080'
 
 const OPERATION_TYPES = [
   { id: 1, name: 'Purchase', desc: 'paid / refunded / chargedback' },
