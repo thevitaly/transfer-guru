@@ -56,21 +56,35 @@ function App() {
     }
   }
 
-  async function loadDefaultFile() {
+  async function uploadFile(file) {
     setLoading(true)
     setError(null)
     try {
-      const res = await fetch(`${API_URL}/api/load-default`, { method: 'POST' })
+      const formData = new FormData()
+      formData.append('file', file)
+      const res = await fetch(`${API_URL}/api/upload`, {
+        method: 'POST',
+        body: formData
+      })
       const data = await res.json()
       if (data.success) {
         setStatus({ loaded: true, filename: data.filename, row_count: data.total_rows })
         loadCurrencies()
         loadSummary()
+      } else {
+        setError(data.detail || 'Failed to upload file')
       }
     } catch (e) {
-      setError('Failed to load file')
+      setError('Failed to upload file')
     }
     setLoading(false)
+  }
+
+  function handleFileSelect(e) {
+    const file = e.target.files[0]
+    if (file) {
+      uploadFile(file)
+    }
   }
 
   async function loadCurrencies() {
@@ -263,13 +277,18 @@ function App() {
           <div className="status-info">
             <span className="status-badge loaded">Loaded</span>
             <span>{status.filename} — {status.row_count.toLocaleString()} rows</span>
+            <label className="file-upload-btn">
+              Load another file
+              <input type="file" accept=".xlsx" onChange={handleFileSelect} disabled={loading} />
+            </label>
           </div>
         ) : (
           <div className="status-info">
             <span className="status-badge">No data</span>
-            <button onClick={loadDefaultFile} disabled={loading}>
-              {loading ? 'Loading...' : 'Load tab.xlsx'}
-            </button>
+            <label className="file-upload-btn primary">
+              {loading ? 'Loading...' : 'Upload XLSX file'}
+              <input type="file" accept=".xlsx" onChange={handleFileSelect} disabled={loading} />
+            </label>
           </div>
         )}
       </section>

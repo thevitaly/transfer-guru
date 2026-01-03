@@ -112,6 +112,37 @@ button.primary:hover:not(:disabled) {
   box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
 }
 
+/* File upload button */
+.file-upload-btn {
+  padding: 10px 20px;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 0.95rem;
+  background: #e0e0e0;
+  color: #333;
+  transition: all 0.2s;
+  display: inline-block;
+}
+
+.file-upload-btn:hover {
+  background: #d0d0d0;
+}
+
+.file-upload-btn.primary {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+}
+
+.file-upload-btn.primary:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+}
+
+.file-upload-btn input[type="file"] {
+  display: none;
+}
+
 /* Summary cards */
 .summary-cards {
   display: grid;
