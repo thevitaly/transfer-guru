@@ -10,11 +10,8 @@ services:
     environment:
       - PORT=8080
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+    labels:
+      - "traefik.http.middlewares.backend-body.buffering.maxRequestBodyBytes=104857600"
 
   frontend:
     build:
